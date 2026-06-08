@@ -199,40 +199,322 @@ public class Singleton {
 
 <h2 id="sec-04-volatile">4. volatile 与 happens-before</h2>
 
-### 4.1 volatile 能保证什么
+> **一句话**：`volatile` 像给变量贴了个「修改立刻广播」的标签——一个线程改了，其他线程能马上看到最新值；但它**不能**保证 `i++` 这种「读-改-写」一整步不被打断。
 
-- **可见性**：写后立即对其他线程可见
-- **有序性**：禁止特定重排（建立 happens-before）
-- **不保证原子性**：`i++` 仍需 `synchronized` 或原子类
+### 4.1 先搞懂：为什么多线程会「看不见」别人的修改？
 
-### 4.2 适用场景
+每个线程运行时，为了快，会把主内存里的变量**拷贝一份到自己的工作内存**（可理解为 CPU 缓存 / 寄存器里的副本）：
 
-- 状态标志位（`boolean flag`）
-- 双重检查锁中的实例引用
-- 一写多读的配置变量
+```
+主内存（大家共用的黑板）
+   ready = true,  value = 42
+        ↑                ↑
+   线程A的副本        线程B的副本
+   ready = false       ready = false  ← B 可能一直用这个旧值
+   value = 0           value = 0
+```
+
+**没有 volatile 时**，线程 B 可能一直读自己缓存里的旧 `ready = false`，即使线程 A 已经在主内存写了 `true`。这就是**可见性问题**。
+
+**类比**：A 在黑板上写了「下课」，B 却盯着自己笔记本上的旧页「还在上课」，永远等不到下课。
+
+---
+
+### 4.2 volatile 到底做了什么？（三件事，分开记）
+
+| 特性 | 有没有 | 通俗理解 |
+|------|--------|----------|
+| **可见性** | ✅ 有 | 一个线程写入后，其他线程读到的**一定是最新值**（会刷新/失效本地缓存） |
+| **有序性** | ✅ 部分有 | 禁止编译器/CPU 把 volatile 写前后的某些操作乱序调换 |
+| **原子性** | ❌ 没有 | `count++` 是三步（读→加→写），中间可能被别的线程插队 |
+
+可以记口诀：**volatile 管看得见、管一点顺序，不管算一整步。**
+
+#### 底层简化理解（不必背，帮助建立直觉）
+
+对 `volatile` 变量的写，大致相当于：
+
+1. 把本地修改**立刻刷到主内存**
+2. 让其他 CPU 核上该变量的缓存**失效**，下次读必须从主内存拿
+
+对 `volatile` 变量的读，大致相当于：
+
+1. **放弃**本地旧副本，从主内存读最新值
+
+所以它比「普通变量靠运气同步」可靠得多，但比 `synchronized` 轻——**不加锁，不互斥**。
+
+---
+
+### 4.3 可见性：最经典的 bug 与修复
+
+#### ❌ 没有 volatile —— 子线程可能永远循环
+
+```java
+public class VisibilityBug {
+    private static boolean ready = false;  // 危险：没有 volatile
+    private static int value = 0;
+
+    public static void main(String[] args) throws InterruptedException {
+        new Thread(() -> {
+            while (!ready) {
+                // 空转，可能永远出不去！
+            }
+            System.out.println("value = " + value);  // 即使出来，也可能打印 0
+        }).start();
+
+        value = 42;
+        ready = true;   // 主线程改了，子线程未必「看见」
+    }
+}
+```
+
+**为什么会这样？**
+
+1. 子线程的 `while (!ready)` 可能被 JIT **优化**成「只读一次 ready」，后面不再读主内存  
+2. 即使没优化，CPU 缓存也可能让子线程一直看到 `false`  
+3. `value = 42` 和 `ready = true` 还可能被**重排序**，子线程先看到 `ready=true` 但 `value` 还是 0
+
+#### ✅ 加上 volatile —— 标志位立即可见
+
+```java
+private static volatile boolean ready = false;
+private static int value = 0;
+```
+
+只给 `ready` 加 volatile 通常就能让循环退出。  
+若还要保证「看到 ready 为 true 时，value 一定是 42」，需要理解 **happens-before**（见 4.7）：**volatile 写 happens-before 后续对同一 volatile 的读**，且配合传递性，对 `ready` 的读能看到写 `ready` 之前对 `value` 的写入。
+
+更稳妥的写法（语义更清晰）：
+
+```java
+private static volatile boolean ready = false;
+private static volatile int value = 0;   // 或只用 synchronized / Atomic 包起来
+```
+
+---
+
+### 4.4 原子性：volatile **不能**用于 count++
+
+很多人误以为「加了 volatile 就线程安全了」，这是错的。
+
+`count++` 在字节码里大致是三步：
+
+```
+1. 从内存读取 count 到寄存器     ← 线程A读到 0
+2. 寄存器 + 1                   ← 线程A算成 1
+                                ← 线程B也读到 0，也算成 1
+3. 写回内存                     ← 两次都写 1，本应是 2
+```
+
+```java
+public class VolatileCounter {
+    private volatile int count = 0;
+
+    public void increment() {
+        count++;   // ❌ 两个线程各加 10000 次，结果常小于 20000
+    }
+}
+```
+
+**修复方式**（三选一）：
+
+```java
+// 方式1：synchronized
+public synchronized void increment() { count++; }
+
+// 方式2：原子类（推荐）
+private AtomicInteger count = new AtomicInteger(0);
+public void increment() { count.incrementAndGet(); }
+
+// 方式3：LongAdder（高并发计数，见第 6 节）
+```
+
+**判断标准**：
+
+- 只是**赋值** `flag = true`、`instance = obj` → volatile 可以  
+- 是**基于旧值再计算** `i++`、`list.add()` → volatile **不行**
+
+---
+
+### 4.5 适用场景（什么时候用 volatile 刚刚好）
+
+| 场景 | 示例 | 为什么适合 |
+|------|------|------------|
+| **状态开关** | `volatile boolean running` | 只有一个线程写 false，其他线程读 |
+| **一写多读配置** | `volatile int configVersion` | 写完后读者看到新版本号 |
+| **双重检查锁** | `volatile Singleton instance` | 防止 `new` 指令重排导致半初始化对象 |
+| **状态 + 单次发布** | 先写数据，再 volatile 写标志 | 配合 happens-before 发布数据 |
+
+#### 案例：优雅停止线程
 
 ```java
 public class VolatileFlag {
     private volatile boolean running = true;
 
-    public void stop() { running = false; }
+    public void stop() {
+        running = false;   // 主线程写，工作线程读 → 典型一写多读
+    }
 
     public void loop() {
         while (running) {
-            // do work
+            doWork();
         }
+        System.out.println("stopped gracefully");
     }
 }
 ```
 
-### 4.3 happens-before 规则（常考）
+#### 案例：双重检查锁（DCL）为什么必须 volatile
 
-1. 程序顺序规则  
-2. 监视器锁规则：`unlock` happens-before 后续 `lock`  
-3. `volatile` 写 happens-before 后续对同一变量的读  
-4. 线程 `start()` happens-before 线程内动作  
-5. 线程内动作 happens-before `join()` 返回  
-6. 传递性  
+```java
+public class Singleton {
+    private static volatile Singleton instance;  // 不能省略 volatile
+
+    public static Singleton getInstance() {
+        if (instance == null) {                  // 第一次检查
+            synchronized (Singleton.class) {
+                if (instance == null) {          // 第二次检查
+                    instance = new Singleton();  // 不是原子操作！
+                }
+            }
+        }
+        return instance;
+    }
+}
+```
+
+`new Singleton()` 可能被重排为：
+
+```
+1. 分配内存
+2. instance 指向这块内存   ← 此时对象还没初始化完
+3. 执行构造函数
+```
+
+若 `instance` 不是 volatile，其他线程可能在步骤 2 之后看到「非 null 但未初始化完」的对象。  
+**volatile 禁止这种重排**，保证「初始化完成」后才对其他线程可见。
+
+---
+
+### 4.6 volatile vs synchronized vs Atomic —— 怎么选？
+
+```
+                    需要互斥（同一时刻只有一个线程操作）？
+                              │
+                    ┌─────────┴─────────┐
+                   是                   否
+                    │                    │
+              synchronized / Lock    只是多个线程「看」到最新值？
+                                         │
+                               ┌─────────┴─────────┐
+                              是                   否
+                               │              可能不需要同步
+                          是简单赋值/标志？
+                               │
+                     ┌─────────┴─────────┐
+                    是                   否（i++、check-then-act）
+                     │                    │
+                 volatile            Atomic / synchronized
+```
+
+| 机制 | 可见性 | 原子性 | 互斥 | 性能 | 典型用途 |
+|------|--------|--------|------|------|----------|
+| 普通变量 | ❌ | ❌ | ❌ | 最快 | 单线程或已用其他方式保护 |
+| **volatile** | ✅ | ❌ | ❌ | 较快 | 标志位、DCL、一写多读 |
+| **synchronized** | ✅ | ✅ | ✅ | 较慢 | 复合操作、临界区 |
+| **AtomicXxx** | ✅ | ✅（单变量） | CAS 非阻塞 | 中等 | 计数器、引用替换 |
+
+---
+
+### 4.7 happens-before（用大白话理解）
+
+**happens-before** 不是「物理时间上谁先谁后」，而是 JVM 保证：
+
+> **如果 A happens-before B，那么 A 的执行结果对 B **一定可见**。**
+
+你可以把它当成「可见性的传递规则」。
+
+#### 和 volatile 最相关的两条
+
+```
+规则1：volatile 写  ──happens-before──▶  后续对同一 volatile 的读
+
+规则2（传递性）：A happens-before B，B happens-before C
+              → A 的结果对 C 可见
+```
+
+#### 举例：发布数据
+
+```java
+private int data = 0;
+private volatile boolean ready = false;
+
+// 线程 A（写）
+data = 100;           // ① 普通写
+ready = true;         // ② volatile 写
+
+// 线程 B（读）
+if (ready) {          // ③ volatile 读
+    use(data);        // ④ 能放心认为 data == 100
+}
+```
+
+推理链：
+
+1. 程序顺序：① happens-before ②  
+2. volatile 规则：② happens-before ③  
+3. 程序顺序：③ happens-before ④  
+4. 传递性：① 对 ④ 可见 → **B 看到 ready 为 true 时，data 一定是 100**
+
+这就是为什么「先写普通变量，再 volatile 写标志位」是安全的**发布模式**。
+
+#### 常考的完整 happens-before 规则
+
+| # | 规则 | 大白话 |
+|---|------|--------|
+| 1 | 程序顺序 | 同一线程里，前面的操作排在后面「之前」 |
+| 2 | 监视器锁 | 解锁 happens-before 后续加锁 |
+| 3 | **volatile** | **volatile 写 happens-before 后续 volatile 读** |
+| 4 | 线程 start | `start()` happens-before 新线程里的任何操作 |
+| 5 | 线程 join | 子线程所有操作 happens-before `join()` 返回 |
+| 6 | 传递性 | 上面规则可串联 |
+
+---
+
+### 4.8 常见误区（面试和写代码都容易踩）
+
+| 误区 | 真相 |
+|------|------|
+| volatile = 线程安全 | 只对**单次读/写**有保证，复合操作不行 |
+| volatile 比 synchronized 快就全用 volatile | 需要原子性时必须上锁或 Atomic |
+| `volatile int` 的 `getAndSet` 安全 | 没有这个方法；`i++` 仍不安全 |
+| 所有变量都加 volatile | 多余，且可能限制优化；按需使用 |
+| `while (!flag) {}` 空转很好 | 应 `Thread.sleep` / `LockSupport.park` / `wait`，否则烧 CPU |
+
+#### 反例：check-then-act 用 volatile 仍不安全
+
+```java
+private volatile int size = 0;
+
+public void addIfAbsent(String key) {
+    if (size == 0) {        // 读 size
+        map.put(key, "1");  // 两个线程都可能进来
+        size = 1;           // 写 size
+    }
+}
+```
+
+两个线程可能同时读到 `size == 0`，都执行 put。必须用 `synchronized` 或原子逻辑。
+
+---
+
+### 4.9 小结（背这 5 条就够应付大部分场景）
+
+1. **volatile 解决可见性**：一个线程改了，别的线程不会一直读旧缓存  
+2. **volatile 不解决原子性**：`i++`、`size++` 不行  
+3. **典型用法**：`boolean flag`、DCL 的 `instance`、一写多读的版本号/状态  
+4. **happens-before**：volatile 写之前的操作，对「读到 volatile 新值」的线程可见（配合传递性）  
+5. **拿不准时**：用 `AtomicXxx` 或 `synchronized`，别硬上 volatile  
 
 ---
 
@@ -252,6 +534,8 @@ public class VolatileFlag {
 
 ### 5.3 使用案例：没有同步时的可见性问题
 
+> 更完整的 volatile 讲解见 [第 4 节](#sec-04-volatile)。
+
 ```java
 public class VisibilityBug {
     private static boolean ready = false; // 未 volatile 可能永远看不到 true
@@ -268,7 +552,14 @@ public class VisibilityBug {
 }
 ```
 
-修复：将 `ready` 改为 `volatile`，或使用 `AtomicBoolean`。
+**原因简述**：子线程工作内存/cache 中的 `ready` 可能是旧值；且 `value=42` 与 `ready=true` 可能被重排序。
+
+**修复**：
+
+```java
+private static volatile boolean ready = false;  // 至少保证标志可见
+// 若要求看到 ready 时 value 必为 42，依赖 volatile 的 happens-before（见 4.7）
+```
 
 ---
 
